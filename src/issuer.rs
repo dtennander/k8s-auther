@@ -86,7 +86,7 @@ impl Issuer {
         let (auth_url, csrf_token, _) = auth_req.url();
         open::that(auth_url.as_str())?;
         // Listen for the redirect
-        let (code, returned_token) = self.await_callback()?;
+        let (code, returned_token) = await_callback()?;
         if csrf_token.secret() != returned_token.secret() {
             return Err(anyhow!("CSRF Token mismatch!"));
         }
@@ -109,33 +109,56 @@ impl Issuer {
             }),
         })
     }
+}
 
-    fn await_callback(&self) -> Result<(AuthorizationCode, CsrfToken)> {
-        let (mut stream, _) = TcpListener::bind("127.0.0.1:8080")?.accept()?;
-        let mut req = String::new();
-        stream.read_to_string(&mut req)?;
-        let url_line = req.lines().next().context("Tried to get url_line")?;
-        let url = Url::parse(&format!(
-            "http://127.0.0.1:8080{}",
-            url_line
-                .split_whitespace()
-                .nth(1)
-                .context("Should find path after first space")?
-        ))?;
-        let params: HashMap<_, _> = url.query_pairs().collect();
-        let code = params.get("code").context("we should get a code")?;
-        let state = params.get("state").context("we should get a state")?;
-        stream.write_all(
-            b"HTTP/1.1 200 OK
-Content-Type: text/html
-
-Authentication complete. You can close this window.
-        ",
-        )?;
-        stream.flush()?;
-        Ok((
-            AuthorizationCode::new(code.to_string()),
-            CsrfToken::new(state.to_string()),
-        ))
+fn await_callback() -> Result<(AuthorizationCode, CsrfToken)> {
+    let listener = TcpListener::bind("127.0.0.1:8080")
+        .context("Failed to bind to 127.0.0.1:8080. The port may already be in use.")?;
+    let (mut stream, _) = listener.accept()?;
+    let req = read_http_headers(&mut stream)?;
+    let req_str = String::from_utf8_lossy(&req);
+    let url_line = req_str.lines().next().context("Tried to get url_line")?;
+    let mut parts = url_line.split_whitespace();
+    let method = parts.next().context("No HTTP method in request line")?;
+    let path = parts.next().context("No path in request line")?;
+    let _http_version = parts.next().context("No HTTP version in request line")?;
+    if method != "GET" {
+        return Err(anyhow!("Only GET method is supported in callback"));
     }
+    let url = Url::parse(&format!("http://127.0.0.1:8080{}", path))?;
+    let params: HashMap<_, _> = url.query_pairs().collect();
+    let code = params.get("code").context("we should get a code")?;
+    let state = params.get("state").context("we should get a state")?;
+    let response_body = "Authentication complete. You can close this window.\n";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        response_body.len(),
+        response_body
+    );
+    stream.write_all(response.as_bytes())?;
+    stream.flush()?;
+    Ok((
+        AuthorizationCode::new(code.to_string()),
+        CsrfToken::new(state.to_string()),
+    ))
+}
+
+fn read_http_headers(stream: &mut std::net::TcpStream) -> Result<Vec<u8>> {
+    let mut buf = [0; 4096];
+    let mut req = Vec::new();
+    loop {
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        req.extend_from_slice(&buf[..n]);
+        if req.windows(4).any(|w| w == b"\r\n\r\n") || req.windows(2).any(|w| w == b"\n\n") {
+            break;
+        }
+        // Prevent reading large bodies (should be headers only)
+        if req.len() > 8192 {
+            break;
+        }
+    }
+    Ok(req)
 }
